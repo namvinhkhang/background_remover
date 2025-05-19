@@ -1,6 +1,6 @@
-
-name: eyeq_cv
+name: eyeq_cv_enhanced
 channels:
+  - pytorch
   - conda-forge
   - defaults
 dependencies:
@@ -10,11 +10,21 @@ dependencies:
   - python-multipart
   - opencv
   - pymongo
-  - numpy>=2.0.0  # Keep NumPy 2.0 - no conflicts without PyTorch
+  # Deep Learning
+  - pytorch>=2.0.0
+  - torchvision>=0.15.0
+  - cpuonly  # Remove this line if you want GPU support
+  # Image Processing
+  - numpy=1.24.*  # Pin to 1.x for PyTorch compatibility
   - scipy
   - scikit-learn
   - scikit-image
   - pillow
+  - imageio
+  - albumentations
+  # Utilities
+  - tqdm
+  - psutil
   - pip
   - pip:
     - python-jose
@@ -22,3 +32,6 @@ dependencies:
     - requests
     - charset-normalizer
     - chardet
+    - gdown
+    - huggingface-hub
+    - onnxruntime

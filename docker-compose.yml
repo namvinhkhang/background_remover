@@ -2,20 +2,31 @@ services:
   # Main API service
   background-removal-api:
     build: .
-    container_name: bg_removal_api
+    container_name: bg_removal_api_enhanced
     ports:
       - "8080:8080"
     environment:
       - MONGODB_URI=mongodb://mongodb:27017/
       - UPLOAD_DIR=/app/uploads
       - RESULT_DIR=/app/results
+      - MODEL_CACHE_DIR=/app/models/pretrained
+      - OMP_NUM_THREADS=4
+      - TORCH_HOME=/app/cache
     volumes:
       - ./uploads:/app/uploads
       - ./results:/app/results
       - ./models:/app/models
+      - model_cache:/app/cache
     depends_on:
       - mongodb
     restart: unless-stopped
+    # Increase memory limit for deep learning models
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
 
   # MongoDB for metadata storage
   mongodb:
@@ -29,9 +40,21 @@ services:
       - MONGO_INITDB_DATABASE=segmentation_db
     restart: unless-stopped
 
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: bg_removal_cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
 volumes:
   mongodb_data:
+  model_cache:  # Cache for downloaded models
+  redis_data:
 
 networks:
   default:
-    name: bg_removal_network
+    name: bg_removal_network_enhanced
