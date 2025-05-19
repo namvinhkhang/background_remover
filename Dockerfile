@@ -29,6 +29,7 @@ RUN mkdir -p uploads results models cache
 
 # Copy application code
 COPY app.py .
+COPY u2net.py .
 
 # Set environment variables
 ENV PYTHONPATH=/app
