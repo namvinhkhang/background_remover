@@ -1,0 +1,24 @@
+
+name: eyeq_cv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - fastapi
+  - uvicorn
+  - python-multipart
+  - opencv
+  - pymongo
+  - numpy>=2.0.0  # Keep NumPy 2.0 - no conflicts without PyTorch
+  - scipy
+  - scikit-learn
+  - scikit-image
+  - pillow
+  - pip
+  - pip:
+    - python-jose
+    - python-dotenv
+    - requests
+    - charset-normalizer
+    - chardet

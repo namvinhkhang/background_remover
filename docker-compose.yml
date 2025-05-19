@@ -1,0 +1,37 @@
+services:
+  # Main API service
+  background-removal-api:
+    build: .
+    container_name: bg_removal_api
+    ports:
+      - "8080:8080"
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/
+      - UPLOAD_DIR=/app/uploads
+      - RESULT_DIR=/app/results
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./models:/app/models
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+
+  # MongoDB for metadata storage
+  mongodb:
+    image: mongo:5.0
+    container_name: bg_removal_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=segmentation_db
+    restart: unless-stopped
+
+volumes:
+  mongodb_data:
+
+networks:
+  default:
+    name: bg_removal_network
