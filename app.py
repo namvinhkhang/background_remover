@@ -212,25 +212,46 @@ class ModelManager:
         logger.info(f"Loaded {len(self.models)} models: {list(self.models.keys())}")
 
 
-class EnhancedBackgroundRemover:
+class AdvancedBackgroundRemover:
     def __init__(self, model_manager: ModelManager):
         self.model_manager = model_manager
         
-    def preprocess_image_u2net(self, image: np.ndarray, target_size: Tuple[int, int]) -> torch.Tensor:
-        """Preprocess image for U2NET"""
+    def preprocess_image_u2net_fixed(self, image: np.ndarray, target_size: Tuple[int, int]) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int]]:
+        """
+        Fixed preprocessing that preserves aspect ratio and returns transform info
+        """
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        original_height, original_width = image_rgb.shape[:2]
         
-        # Resize image
-        image_resized = cv2.resize(image_rgb, target_size)
+        # Calculate aspect-ratio preserving resize
+        target_width, target_height = target_size
+        scale = min(target_width / original_width, target_height / original_height)
+        
+        new_width = int(original_width * scale)
+        new_height = int(original_height * scale)
+        
+        # Resize image preserving aspect ratio
+        image_resized = cv2.resize(image_rgb, (new_width, new_height))
+        
+        # Create canvas and center the image
+        canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        
+        # Calculate padding
+        pad_y = (target_height - new_height) // 2
+        pad_x = (target_width - new_width) // 2
+        
+        # Place resized image on canvas
+        canvas[pad_y:pad_y + new_height, pad_x:pad_x + new_width] = image_resized
         
         # Normalize to [0, 1]
-        image_normalized = image_resized.astype(np.float32) / 255.0
+        canvas_normalized = canvas.astype(np.float32) / 255.0
         
         # Convert to tensor and add batch dimension
-        image_tensor = torch.from_numpy(image_normalized.transpose(2, 0, 1)).unsqueeze(0).to(device)
+        image_tensor = torch.from_numpy(canvas_normalized.transpose(2, 0, 1)).unsqueeze(0).to(device)
         
-        return image_tensor
+        # Return tensor, original shape, and padding info for reverse transform
+        return image_tensor, (original_height, original_width), (pad_y, pad_x, new_height, new_width)
 
     def preprocess_image_modnet(self, image: np.ndarray, target_size: Tuple[int, int]) -> torch.Tensor:
         """Preprocess image for MODNet"""
@@ -247,8 +268,11 @@ class EnhancedBackgroundRemover:
         image_tensor = transform(image_pil).unsqueeze(0).to(device)
         return image_tensor
 
-    def postprocess_mask_u2net(self, output: torch.Tensor, original_shape: Tuple[int, int]) -> np.ndarray:
-        """Post-process U2NET output"""
+    def postprocess_mask_u2net_fixed(self, output: torch.Tensor, original_shape: Tuple[int, int], 
+                                   padding_info: Tuple[int, int, int, int]) -> np.ndarray:
+        """
+        Fixed post-processing that correctly handles aspect ratio preservation
+        """
         # U2NET returns multiple outputs, use the first one (main prediction)
         if isinstance(output, tuple):
             mask = output[0]
@@ -258,8 +282,14 @@ class EnhancedBackgroundRemover:
         # Convert to numpy
         mask_np = mask.squeeze().cpu().detach().numpy()
         
-        # Resize to original shape
-        mask_resized = cv2.resize(mask_np, (original_shape[1], original_shape[0]))
+        # Extract padding info
+        pad_y, pad_x, new_height, new_width = padding_info
+        
+        # Extract the actual predicted region (remove padding)
+        mask_crop = mask_np[pad_y:pad_y + new_height, pad_x:pad_x + new_width]
+        
+        # Resize back to original dimensions
+        mask_resized = cv2.resize(mask_crop, (original_shape[1], original_shape[0]))
         
         # Ensure values are in [0, 1]
         mask_resized = np.clip(mask_resized, 0, 1)
@@ -272,78 +302,127 @@ class EnhancedBackgroundRemover:
         mask_resized = cv2.resize(mask_np, (original_shape[1], original_shape[0]))
         return mask_resized
 
-    def ensemble_masks(self, masks: list, weights: list = None) -> np.ndarray:
-        """Ensemble multiple masks with optional weights"""
+    def ensemble_masks_improved(self, masks: list, confidences: list = None) -> np.ndarray:
+        """
+        Improved ensemble that handles edge cases better
+        """
         if not masks:
             return None
             
-        if weights is None:
-            weights = [1.0] * len(masks)
+        if len(masks) == 1:
+            return masks[0]
+            
+        if confidences is None:
+            confidences = [1.0] * len(masks)
         
-        # Normalize weights
-        weights = np.array(weights)
-        weights = weights / np.sum(weights)
+        # Normalize confidences
+        confidences = np.array(confidences)
+        confidences = confidences / (np.sum(confidences) + 1e-8)
         
-        # Weighted average
+        # Calculate variance to detect disagreement between models
+        mask_stack = np.stack(masks, axis=0)
+        mask_variance = np.var(mask_stack, axis=0)
+        
+        # Where models agree (low variance), use weighted average
+        # Where models disagree (high variance), bias towards higher confidence
         ensemble_mask = np.zeros_like(masks[0])
-        for mask, weight in zip(masks, weights):
-            ensemble_mask += mask * weight
+        
+        agreement_threshold = 0.1
+        agreement_mask = mask_variance < agreement_threshold
+        
+        # For regions where models agree
+        for i, (mask, conf) in enumerate(zip(masks, confidences)):
+            ensemble_mask += mask * conf
+            
+        # For regions where models disagree, boost the most confident prediction
+        disagreement_mask = ~agreement_mask
+        if np.any(disagreement_mask):
+            best_idx = np.argmax(confidences)
+            ensemble_mask[disagreement_mask] = masks[best_idx][disagreement_mask]
             
         return ensemble_mask
 
-    def advanced_edge_analysis_fast(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Fast edge analysis with reduced computational complexity"""
+    def advanced_edge_analysis_conservative(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """
+        More conservative edge analysis that preserves subject boundaries
+        """
         h, w = mask.shape
         refined_mask = mask.copy()
         
-        # Multi-scale edge detection
-        edges_canny = cv2.Canny((mask * 255).astype(np.uint8), 30, 100)
+        # Use multiple edge detection methods for robustness
+        mask_uint8 = (mask * 255).astype(np.uint8)
         
-        # Dilate edges to create processing region (smaller kernel for speed)
-        kernel = np.ones((5, 5), np.uint8)
-        edge_region = cv2.dilate(edges_canny, kernel, iterations=1)
+        # Canny edge detection with multiple scales
+        edges_fine = cv2.Canny(mask_uint8, 50, 150)
+        edges_coarse = cv2.Canny(mask_uint8, 30, 100)
         
-        # Convert image to Lab for better color analysis
+        # Combine edge maps
+        edges_combined = np.maximum(edges_fine, edges_coarse)
+        
+        # Create a more conservative processing region
+        kernel_small = np.ones((3, 3), np.uint8)
+        edge_region = cv2.dilate(edges_combined, kernel_small, iterations=1)
+        
+        # Convert image to multiple color spaces for robustness
         lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
         
         # Find edge coordinates
         edge_coords = np.where(edge_region > 0)
         
-        # Process in batches for better performance
-        batch_size = 1000
+        # Process in smaller batches with more conservative updates
+        batch_size = 500
         for i in range(0, len(edge_coords[0]), batch_size):
             batch_y = edge_coords[0][i:i+batch_size]
             batch_x = edge_coords[1][i:i+batch_size]
             
             for j, (y, x) in enumerate(zip(batch_y, batch_x)):
-                if 8 <= y < h-8 and 8 <= x < w-8:
-                    # Smaller neighborhood for speed (9x9 instead of 31x31)
-                    local_image = lab_image[y-4:y+5, x-4:x+5]
-                    local_mask = mask[y-4:y+5, x-4:x+5]
+                if 6 <= y < h-6 and 6 <= x < w-6:
+                    # Smaller neighborhood (7x7 instead of 9x9)
+                    local_lab = lab_image[y-3:y+4, x-3:x+4]
+                    local_hsv = hsv_image[y-3:y+4, x-3:x+4]
+                    local_mask = mask[y-3:y+4, x-3:x+4]
                     
-                    # Calculate color gradients
-                    center_color = lab_image[y, x]
-                    color_distances = np.linalg.norm(local_image - center_color, axis=2)
-                    color_distances = color_distances / (np.max(color_distances) + 1e-6)
+                    # Calculate color consistency in both color spaces
+                    center_lab = lab_image[y, x]
+                    center_hsv = hsv_image[y, x]
                     
-                    # Create confidence maps
-                    fg_mask = local_mask > 0.7
-                    bg_mask = local_mask < 0.3
+                    lab_distances = np.linalg.norm(local_lab - center_lab, axis=2)
+                    hsv_distances = np.linalg.norm(local_hsv - center_hsv, axis=2)
+                    
+                    # Normalize distances
+                    lab_distances = lab_distances / (np.max(lab_distances) + 1e-6)
+                    hsv_distances = hsv_distances / (np.max(hsv_distances) + 1e-6)
+                    
+                    # Create more conservative confidence maps
+                    fg_mask = local_mask > 0.8  # Higher threshold for foreground
+                    bg_mask = local_mask < 0.2  # Lower threshold for background
                     
                     if np.any(fg_mask) and np.any(bg_mask):
-                        # Simplified confidence calculation
-                        fg_confidence = 1.0 - np.mean(color_distances[fg_mask])
-                        bg_confidence = 1.0 - np.mean(color_distances[bg_mask])
+                        # Calculate confidence in both color spaces
+                        lab_fg_conf = 1.0 - np.mean(lab_distances[fg_mask])
+                        lab_bg_conf = 1.0 - np.mean(lab_distances[bg_mask])
                         
-                        # Update alpha with reduced blending
-                        if fg_confidence + bg_confidence > 0:
-                            new_alpha = fg_confidence / (fg_confidence + bg_confidence)
-                            refined_mask[y, x] = 0.7 * refined_mask[y, x] + 0.3 * new_alpha
+                        hsv_fg_conf = 1.0 - np.mean(hsv_distances[fg_mask])
+                        hsv_bg_conf = 1.0 - np.mean(hsv_distances[bg_mask])
+                        
+                        # Combine confidences from both color spaces
+                        fg_confidence = (lab_fg_conf + hsv_fg_conf) / 2
+                        bg_confidence = (lab_bg_conf + hsv_bg_conf) / 2
+                        
+                        # Only update if we have strong confidence and preserve subject
+                        total_conf = fg_confidence + bg_confidence
+                        if total_conf > 0.5:  # Higher threshold for updates
+                            new_alpha = fg_confidence / total_conf
+                            # More conservative blending (less aggressive changes)
+                            refined_mask[y, x] = 0.8 * refined_mask[y, x] + 0.2 * new_alpha
         
         return refined_mask
 
-    def spectral_matting_optimized(self, image: np.ndarray, trimap: np.ndarray) -> np.ndarray:
-        """Optimized spectral matting - much faster than the enhanced version"""
+    def spectral_matting_multi_colorspace_fixed(self, image: np.ndarray, trimap: np.ndarray) -> np.ndarray:
+        """
+        FIXED: Enhanced spectral matting using multiple color spaces for better robustness
+        """
         alpha = trimap.copy().astype(np.float32) / 255.0
         
         # Find unknown regions
@@ -352,10 +431,12 @@ class EnhancedBackgroundRemover:
         if not np.any(unknown_mask):
             return alpha
         
-        logger.info("Running optimized spectral matting...")
+        logger.info("Running multi-colorspace spectral matting...")
         
-        # Convert to LAB color space only (faster than multiple color spaces)
+        # Convert to multiple color spaces - FIXED: cv2 is imported at top
         lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32)
         
         # Get known regions
         fg_mask = (trimap == 255)
@@ -364,79 +445,127 @@ class EnhancedBackgroundRemover:
         if not (np.any(fg_mask) and np.any(bg_mask)):
             return alpha
         
-        # Sample colors more efficiently
-        fg_colors = lab_image[fg_mask]
-        bg_colors = lab_image[bg_mask]
+        # Sample colors from all color spaces
+        max_samples = 2000  # Increased sample size for better accuracy
         
-        # Limit sample size for performance (use at most 1000 samples each)
-        max_samples = 1000
-        if len(fg_colors) > max_samples:
-            indices = np.random.choice(len(fg_colors), max_samples, replace=False)
-            fg_colors = fg_colors[indices]
-        if len(bg_colors) > max_samples:
-            indices = np.random.choice(len(bg_colors), max_samples, replace=False)
-            bg_colors = bg_colors[indices]
+        color_spaces = [
+            ("LAB", lab_image),
+            ("HSV", hsv_image), 
+            ("RGB", rgb_image)
+        ]
         
-        # Get unknown pixels coordinates
-        unknown_coords = np.where(unknown_mask)
-        unknown_pixels = lab_image[unknown_coords]
+        alpha_results = []
         
-        logger.info(f"Processing {len(unknown_pixels)} unknown pixels...")
+        for space_name, color_image in color_spaces:
+            # Sample foreground and background colors
+            fg_colors = color_image[fg_mask]
+            bg_colors = color_image[bg_mask]
+            
+            # Limit sample size for performance
+            if len(fg_colors) > max_samples:
+                indices = np.random.choice(len(fg_colors), max_samples, replace=False)
+                fg_colors = fg_colors[indices]
+            if len(bg_colors) > max_samples:
+                indices = np.random.choice(len(bg_colors), max_samples, replace=False)
+                bg_colors = bg_colors[indices]
+            
+            # Get unknown pixels coordinates
+            unknown_coords = np.where(unknown_mask)
+            unknown_pixels = color_image[unknown_coords]
+            
+            # Vectorized distance computation
+            unknown_expanded = unknown_pixels[:, np.newaxis, :]
+            fg_expanded = fg_colors[np.newaxis, :, :]
+            bg_expanded = bg_colors[np.newaxis, :, :]
+            
+            # Compute distances with different weightings for different color spaces
+            if space_name == "LAB":
+                # Weight L channel more for LAB
+                weights = np.array([1.5, 1.0, 1.0])
+                fg_distances = np.sqrt(np.sum((unknown_expanded - fg_expanded) ** 2 * weights, axis=2))
+                bg_distances = np.sqrt(np.sum((unknown_expanded - bg_expanded) ** 2 * weights, axis=2))
+            elif space_name == "HSV":
+                # Special handling for HSV (hue wrapping)
+                diff_fg = unknown_expanded - fg_expanded
+                diff_bg = unknown_expanded - bg_expanded
+                
+                # Handle hue wrapping
+                diff_fg[:, :, 0] = np.minimum(np.abs(diff_fg[:, :, 0]), 180 - np.abs(diff_fg[:, :, 0]))
+                diff_bg[:, :, 0] = np.minimum(np.abs(diff_bg[:, :, 0]), 180 - np.abs(diff_bg[:, :, 0]))
+                
+                fg_distances = np.linalg.norm(diff_fg, axis=2)
+                bg_distances = np.linalg.norm(diff_bg, axis=2)
+            else:  # RGB
+                fg_distances = np.linalg.norm(unknown_expanded - fg_expanded, axis=2)
+                bg_distances = np.linalg.norm(unknown_expanded - bg_expanded, axis=2)
+            
+            # Find minimum distances for each unknown pixel
+            min_fg_dist = np.min(fg_distances, axis=1)
+            min_bg_dist = np.min(bg_distances, axis=1)
+            
+            # Calculate alpha values
+            total_dist = min_fg_dist + min_bg_dist
+            valid_mask = total_dist > 0
+            
+            space_alpha = alpha.copy()
+            alpha_values = np.zeros(len(unknown_pixels))
+            alpha_values[valid_mask] = min_bg_dist[valid_mask] / total_dist[valid_mask]
+            space_alpha[unknown_coords] = alpha_values
+            
+            alpha_results.append(space_alpha)
         
-        # Vectorized distance computation (much faster)
-        # Reshape for broadcasting: (n_unknown, 1, 3) and (1, n_fg, 3)
-        unknown_expanded = unknown_pixels[:, np.newaxis, :]
-        fg_expanded = fg_colors[np.newaxis, :, :]
-        bg_expanded = bg_colors[np.newaxis, :, :]
+        # Ensemble results from different color spaces
+        final_alpha = np.mean(alpha_results, axis=0)
         
-        # Compute all distances at once
-        fg_distances = np.linalg.norm(unknown_expanded - fg_expanded, axis=2)
-        bg_distances = np.linalg.norm(unknown_expanded - bg_expanded, axis=2)
-        
-        # Find minimum distances for each unknown pixel
-        min_fg_dist = np.min(fg_distances, axis=1)
-        min_bg_dist = np.min(bg_distances, axis=1)
-        
-        # Calculate alpha values vectorized
-        total_dist = min_fg_dist + min_bg_dist
-        valid_mask = total_dist > 0
-        
-        alpha_values = np.zeros(len(unknown_pixels))
-        alpha_values[valid_mask] = min_bg_dist[valid_mask] / total_dist[valid_mask]
-        
-        # Update alpha array
-        alpha[unknown_coords] = alpha_values
-        
-        # Apply simple bilateral smoothing to the result
-        alpha_uint8 = (alpha * 255).astype(np.uint8)
-        smoothed = cv2.bilateralFilter(alpha_uint8, 9, 40, 40)
+        # Apply edge-preserving smoothing
+        alpha_uint8 = (final_alpha * 255).astype(np.uint8)
+        smoothed = cv2.bilateralFilter(alpha_uint8, 9, 50, 50)
         
         return smoothed / 255.0
 
-    def color_decontamination_fast(self, image: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-        """Fast color decontamination with simplified background estimation"""
+    def color_decontamination_improved(self, image: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        """
+        Improved color decontamination with better edge preservation
+        """
         h, w = image.shape[:2]
         decontaminated = image.copy().astype(np.float32)
         
-        # Find edge regions with simpler threshold
+        # Create a more precise edge map
         alpha_uint8 = (alpha * 255).astype(np.uint8)
         edges = cv2.Canny(alpha_uint8, 30, 100)
-        kernel = np.ones((5, 5), np.uint8)
+        
+        # Use smaller kernel for more precise processing
+        kernel = np.ones((3, 3), np.uint8)
         edge_region = cv2.dilate(edges, kernel, iterations=1)
         
-        # Quick background color estimation
-        bg_mask = alpha < 0.1
-        
+        # Better background color estimation using median of multiple regions
+        bg_mask = alpha < 0.05
         if np.any(bg_mask):
-            bg_color = np.median(image[bg_mask].astype(np.float32), axis=0)
+            # Sample from different regions to get a more robust background estimate
+            bg_pixels = image[bg_mask].astype(np.float32)
+            if len(bg_pixels) > 1000:
+                # Use median of random samples for more stable estimate
+                sample_indices = np.random.choice(len(bg_pixels), 1000, replace=False)
+                bg_color = np.median(bg_pixels[sample_indices], axis=0)
+            else:
+                bg_color = np.median(bg_pixels, axis=0)
         else:
-            bg_color = np.array([128, 128, 128])
+            # Fallback: estimate from corner regions
+            corner_size = min(h//10, w//10, 20)
+            corners = [
+                image[:corner_size, :corner_size],
+                image[:corner_size, -corner_size:],
+                image[-corner_size:, :corner_size],
+                image[-corner_size:, -corner_size:]
+            ]
+            corner_pixels = np.concatenate([corner.reshape(-1, 3) for corner in corners])
+            bg_color = np.median(corner_pixels.astype(np.float32), axis=0)
         
-        # Process edge regions more efficiently
+        # Process edge regions more carefully
         edge_coords = np.where(edge_region > 0)
         
-        # Process in batches
-        batch_size = 2000
+        # Process in smaller batches for better quality
+        batch_size = 1000
         for i in range(0, len(edge_coords[0]), batch_size):
             batch_y = edge_coords[0][i:i+batch_size]
             batch_x = edge_coords[1][i:i+batch_size]
@@ -445,20 +574,24 @@ class EnhancedBackgroundRemover:
             batch_alpha = alpha[batch_y, batch_x]
             batch_colors = image[batch_y, batch_x].astype(np.float32)
             
-            # Find semi-transparent pixels
-            semi_transparent = (batch_alpha > 0.05) & (batch_alpha < 0.95)
+            # More conservative semi-transparent pixel selection
+            semi_transparent = (batch_alpha > 0.1) & (batch_alpha < 0.9)
             
             if np.any(semi_transparent):
                 st_alpha = batch_alpha[semi_transparent]
                 st_colors = batch_colors[semi_transparent]
                 
-                # Vectorized decontamination
-                fg_colors = (st_colors - (1 - st_alpha)[:, np.newaxis] * bg_color) / st_alpha[:, np.newaxis]
+                # Improved decontamination formula with numerical stability
+                denominator = st_alpha[:, np.newaxis] + 1e-6  # Add small epsilon for stability
+                fg_colors = (st_colors - (1 - st_alpha)[:, np.newaxis] * bg_color) / denominator
                 fg_colors = np.clip(fg_colors, 0, 255)
                 
-                # Apply correction
-                correction_strength = np.minimum(1.0, np.abs(0.5 - st_alpha) * 2) * 0.6
-                corrected_colors = (1 - correction_strength[:, np.newaxis]) * st_colors + correction_strength[:, np.newaxis] * fg_colors
+                # Adaptive correction strength based on alpha confidence
+                alpha_confidence = np.minimum(st_alpha, 1 - st_alpha) * 2  # Peak at 0.5
+                correction_strength = alpha_confidence * 0.5  # More conservative correction
+                
+                corrected_colors = ((1 - correction_strength[:, np.newaxis]) * st_colors + 
+                                  correction_strength[:, np.newaxis] * fg_colors)
                 
                 # Update the decontaminated image
                 st_indices = np.where(semi_transparent)[0]
@@ -468,57 +601,90 @@ class EnhancedBackgroundRemover:
         
         return decontaminated.astype(np.uint8)
 
-    def apply_advanced_bilateral_refinement(self, image: np.ndarray, alpha: np.ndarray) -> np.ndarray:
-        """Advanced bilateral refinement with multiple scales"""
+    def apply_enhanced_bilateral_refinement(self, image: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        """
+        Enhanced bilateral refinement with better edge preservation
+        """
         alpha_uint8 = (alpha * 255).astype(np.uint8)
         
-        # Apply bilateral filtering at multiple scales
-        refined1 = cv2.bilateralFilter(alpha_uint8, 9, 40, 40)
-        refined2 = cv2.bilateralFilter(alpha_uint8, 15, 80, 80) 
-        refined3 = cv2.bilateralFilter(alpha_uint8, 21, 120, 120)
+        # Apply bilateral filtering at multiple scales with better parameters
+        refined1 = cv2.bilateralFilter(alpha_uint8, 5, 30, 30)   # Fine details
+        refined2 = cv2.bilateralFilter(alpha_uint8, 9, 50, 50)   # Medium features  
+        refined3 = cv2.bilateralFilter(alpha_uint8, 13, 80, 80)  # Large features
         
-        # Adaptive combination based on edge strength
+        # Create adaptive weights based on local edge strength
         edges = cv2.Canny(alpha_uint8, 30, 100)
         edge_distance = cv2.distanceTransform(255 - edges, cv2.DIST_L2, 5)
-        edge_distance = edge_distance / np.max(edge_distance)
+        edge_distance = edge_distance / (np.max(edge_distance) + 1e-6)
         
-        # Weight combination based on distance from edges
-        weight1 = np.exp(-edge_distance * 2)
-        weight2 = np.exp(-edge_distance * 1) * (1 - weight1)
-        weight3 = 1 - weight1 - weight2
+        # More sophisticated weight calculation
+        # Near edges: prefer fine filtering
+        # Away from edges: blend all scales
+        weight1 = np.exp(-edge_distance * 1.5)
+        weight3 = np.exp(-edge_distance * 0.5) * (1 - weight1) * 0.3
+        weight2 = 1 - weight1 - weight3
+        
+        # Ensure weights sum to 1
+        total_weight = weight1 + weight2 + weight3
+        weight1 /= total_weight
+        weight2 /= total_weight  
+        weight3 /= total_weight
         
         refined_alpha = (refined1 * weight1 + refined2 * weight2 + refined3 * weight3).astype(np.uint8)
         
-        # Apply guided filter using image as guide
+        # Apply advanced edge-preserving filter if available
         try:
-            guided_alpha = cv2.ximgproc.guidedFilter(
-                guide=image.astype(np.uint8),
-                src=refined_alpha,
-                radius=8,
-                eps=0.02
-            )
-            
-            # Final edge-preserving smoothing
-            final_alpha = cv2.edgePreservingFilter(guided_alpha, flags=1, sigma_s=50, sigma_r=0.4)
-            return final_alpha / 255.0
-            
-        except:
-            # Fallback if guided filter not available
-            final_alpha = cv2.GaussianBlur(refined_alpha, (5, 5), 1.0)
+            # Try guided filter for better edge preservation
+            if hasattr(cv2, 'ximgproc'):
+                guide_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                guided_alpha = cv2.ximgproc.guidedFilter(
+                    guide_image.astype(np.uint8),
+                    refined_alpha,
+                    radius=6,
+                    eps=0.01
+                )
+                
+                # Final light smoothing
+                final_alpha = cv2.medianBlur(guided_alpha, 3)
+                return final_alpha / 255.0
+            else:
+                # Standard fallback
+                final_alpha = cv2.medianBlur(refined_alpha, 3)
+                return final_alpha / 255.0
+                
+        except (ImportError, AttributeError):
+            # Fallback to standard filters
+            final_alpha = cv2.medianBlur(refined_alpha, 3)
             return final_alpha / 255.0
 
-    def create_precise_trimap(self, mask: np.ndarray, fg_erosion: int = 6, bg_dilation: int = 15) -> np.ndarray:
-        """Create precise trimap with adaptive kernel sizes"""
+    def create_adaptive_trimap(self, mask: np.ndarray) -> np.ndarray:
+        """
+        Create adaptive trimap that adjusts based on image content
+        """
         # Convert to binary
         binary_mask = (mask > 0.5).astype(np.uint8)
         
-        # Adaptive kernel sizes based on image content
+        # Calculate adaptive kernel sizes based on mask properties
         h, w = mask.shape
-        scale_factor = min(1.0, max(h, w) / 1000.0)
-        fg_erosion = max(3, int(fg_erosion * scale_factor))
-        bg_dilation = max(8, int(bg_dilation * scale_factor))
+        total_pixels = h * w
+        fg_pixels = np.sum(binary_mask)
+        fg_ratio = fg_pixels / total_pixels
         
-        # Create kernels with different shapes for better results
+        # Adaptive sizing based on foreground size and image dimensions
+        base_size = min(h, w)
+        
+        # Smaller objects need smaller erosion/dilation
+        if fg_ratio < 0.1:  # Small object
+            fg_erosion = max(2, int(base_size * 0.005))
+            bg_dilation = max(5, int(base_size * 0.015))
+        elif fg_ratio < 0.3:  # Medium object  
+            fg_erosion = max(3, int(base_size * 0.008))
+            bg_dilation = max(8, int(base_size * 0.025))
+        else:  # Large object
+            fg_erosion = max(4, int(base_size * 0.012))
+            bg_dilation = max(12, int(base_size * 0.035))
+        
+        # Create adaptive kernels
         fg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fg_erosion, fg_erosion))
         bg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (bg_dilation, bg_dilation))
         
@@ -529,15 +695,28 @@ class EnhancedBackgroundRemover:
         sure_bg = cv2.dilate(binary_mask, bg_kernel, iterations=1)
         sure_bg = 1 - sure_bg
         
-        # Create trimap
+        # Create trimap with validation
         trimap = np.full_like(mask, 128, dtype=np.uint8)  # Unknown = 128
         trimap[sure_fg > 0] = 255  # Foreground = 255
         trimap[sure_bg > 0] = 0    # Background = 0
         
+        # Validate trimap has all three regions
+        unique_values = np.unique(trimap)
+        if len(unique_values) < 3:
+            logger.warning("Trimap missing regions, using fallback")
+            # Fallback: use original mask with slight erosion/dilation
+            fallback_fg = cv2.erode(binary_mask, np.ones((3,3), np.uint8), iterations=1)
+            fallback_bg = 1 - cv2.dilate(binary_mask, np.ones((7,7), np.uint8), iterations=1)
+            trimap = np.full_like(mask, 128, dtype=np.uint8)
+            trimap[fallback_fg > 0] = 255
+            trimap[fallback_bg > 0] = 0
+        
         return trimap
 
-    async def remove_background_with_u2net(self, image: np.ndarray) -> Tuple[np.ndarray, str, float]:
-        """Process with U2NET models and enhanced post-processing"""
+    async def remove_background_with_u2net_advanced(self, image: np.ndarray) -> Tuple[np.ndarray, str, float]:
+        """
+        Advanced U2NET processing with all enhancements
+        """
         start_time = time.time()
         
         u2net_models = [name for name in self.model_manager.models.keys() if name.startswith("u2net")]
@@ -549,35 +728,45 @@ class EnhancedBackgroundRemover:
         masks = []
         model_names = []
         confidences = []
+        padding_infos = []
         
-        # Try each U2NET model
+        # Try each U2NET model with improved preprocessing
         for model_name in u2net_models:
             try:
                 model = self.model_manager.models[model_name]
                 config = self.model_manager.model_configs[model_name]
                 target_size = config["input_size"]
                 
-                # Preprocess
-                input_tensor = self.preprocess_image_u2net(image, target_size)
+                # Use improved preprocessing
+                input_tensor, original_shape, padding_info = self.preprocess_image_u2net_fixed(image, target_size)
                 
                 # Run model
                 with torch.no_grad():
                     output = model(input_tensor)
                 
-                # Post-process
-                raw_mask = self.postprocess_mask_u2net(output, (original_height, original_width))
+                # Use improved post-processing
+                raw_mask = self.postprocess_mask_u2net_fixed(output, original_shape, padding_info)
                 
-                # Calculate confidence based on mask quality
+                # Better confidence calculation
                 coverage = np.mean(raw_mask)
                 edges = cv2.Canny((raw_mask * 255).astype(np.uint8), 50, 150)
                 edge_quality = np.mean(edges) / 255.0
-                confidence = coverage * 0.6 + edge_quality * 0.4
+                
+                # Consider mask smoothness and boundary quality
+                gradient_x = np.abs(np.gradient(raw_mask, axis=1))
+                gradient_y = np.abs(np.gradient(raw_mask, axis=0))
+                smoothness = 1.0 / (1.0 + np.mean(gradient_x + gradient_y))
+                
+                # Weighted confidence score
+                confidence = coverage * 0.4 + edge_quality * 0.3 + smoothness * 0.3
                 
                 masks.append(raw_mask)
                 model_names.append(model_name)
                 confidences.append(confidence)
+                padding_infos.append(padding_info)
                 
-                logger.info(f"{model_name}: coverage={coverage:.3f}, confidence={confidence:.3f}")
+                logger.info(f"{model_name}: coverage={coverage:.3f}, edge_q={edge_quality:.3f}, "
+                          f"smoothness={smoothness:.3f}, confidence={confidence:.3f}")
                 
             except Exception as e:
                 logger.error(f"{model_name} failed: {e}")
@@ -586,44 +775,44 @@ class EnhancedBackgroundRemover:
         if not masks:
             raise Exception("All U2NET models failed")
         
-        # Ensemble the best masks
+        # Improved ensemble
         if len(masks) > 1:
-            # Use top 2 models for ensemble
-            sorted_indices = np.argsort(confidences)[-2:]
-            ensemble_masks = [masks[i] for i in sorted_indices]
-            ensemble_weights = [confidences[i] for i in sorted_indices]
-            final_mask = self.ensemble_masks(ensemble_masks, ensemble_weights)
-            best_model = f"Ensemble({'+'.join([model_names[i] for i in sorted_indices])})"
+            final_mask = self.ensemble_masks_improved(masks, confidences)
+            best_models = [model_names[i] for i in np.argsort(confidences)[-min(2, len(masks)):]]
+            best_model = f"Ensemble({'+'.join(best_models)})"
         else:
             final_mask = masks[0]
             best_model = model_names[0]
         
-        # Apply full enhancement pipeline
-        logger.info("Applying fast edge analysis...")
-        refined_mask = self.advanced_edge_analysis_fast(image, final_mask)
+        # Apply advanced enhancement pipeline
+        logger.info("Applying conservative edge analysis...")
+        refined_mask = self.advanced_edge_analysis_conservative(image, final_mask)
         
-        logger.info("Creating precise trimap...")
-        trimap = self.create_precise_trimap(refined_mask)
+        logger.info("Creating adaptive trimap...")
+        trimap = self.create_adaptive_trimap(refined_mask)
         
-        logger.info("Applying optimized spectral matting...")
-        alpha = self.spectral_matting_optimized(image, trimap)
+        logger.info("Applying multi-colorspace spectral matting...")
+        alpha = self.spectral_matting_multi_colorspace_fixed(image, trimap)
         
-        logger.info("Applying fast bilateral refinement...")
-        alpha = self.apply_advanced_bilateral_refinement(image, alpha)
+        logger.info("Applying enhanced bilateral refinement...")
+        alpha = self.apply_enhanced_bilateral_refinement(image, alpha)
         
-        logger.info("Applying fast color decontamination...")
-        decontaminated_image = self.color_decontamination_fast(image, alpha)
+        logger.info("Applying improved color decontamination...")
+        decontaminated_image = self.color_decontamination_improved(image, alpha)
         
-        # Create final result
+        # Create final result with post-processing validation
+        alpha_final = np.clip(alpha, 0, 1)
         rgba_result = np.zeros((original_height, original_width, 4), dtype=np.uint8)
         rgba_result[:, :, :3] = decontaminated_image
-        rgba_result[:, :, 3] = (alpha * 255).astype(np.uint8)
+        rgba_result[:, :, 3] = (alpha_final * 255).astype(np.uint8)
         
         processing_time = time.time() - start_time
+        logger.info(f"Advanced processing completed in {processing_time:.2f}s")
+        
         return rgba_result, best_model, processing_time
 
     async def remove_background_opencv_enhanced(self, image: np.ndarray) -> Tuple[np.ndarray, str, float]:
-        """Enhanced OpenCV-based background removal with U2NET-like post-processing"""
+        """Enhanced OpenCV-based background removal"""
         start_time = time.time()
         
         height, width = image.shape[:2]
@@ -662,14 +851,14 @@ class EnhancedBackgroundRemover:
                         best_score = score
             
             if best_mask is not None:
-                # Apply all enhancements
-                logger.info("Applying U2NET-style processing to Mask R-CNN result...")
+                # Apply advanced processing pipeline
+                logger.info("Applying advanced processing to Mask R-CNN result...")
                 
-                refined_mask = self.advanced_edge_analysis_fast(image, best_mask)
-                trimap = self.create_precise_trimap(refined_mask)
-                alpha = self.spectral_matting_optimized(image, trimap)
-                alpha = self.apply_advanced_bilateral_refinement(image, alpha)
-                decontaminated_image = self.color_decontamination_fast(image, alpha)
+                refined_mask = self.advanced_edge_analysis_conservative(image, best_mask)
+                trimap = self.create_adaptive_trimap(refined_mask)
+                alpha = self.spectral_matting_multi_colorspace_fixed(image, trimap)
+                alpha = self.apply_enhanced_bilateral_refinement(image, alpha)
+                decontaminated_image = self.color_decontamination_improved(image, alpha)
                 
                 # Create RGBA result
                 rgba_result = np.zeros((height, width, 4), dtype=np.uint8)
@@ -677,48 +866,54 @@ class EnhancedBackgroundRemover:
                 rgba_result[:, :, 3] = (alpha * 255).astype(np.uint8)
                 
                 processing_time = time.time() - start_time
-                return rgba_result, "Enhanced Mask R-CNN + U2NET-style", processing_time
+                return rgba_result, "Enhanced Mask R-CNN + Advanced Processing", processing_time
             
         except Exception as e:
             logger.error(f"Enhanced Mask R-CNN failed: {e}")
         
-        # Fallback: Enhanced ellipse with full processing
-        logger.warning("Using enhanced ellipse fallback with U2NET-style processing")
+        # Fallback: Enhanced ellipse with advanced processing
+        logger.warning("Using enhanced ellipse fallback with advanced processing")
         fallback_mask = np.zeros((height, width), np.float32)
         cv2.ellipse(fallback_mask, (width//2, height//2), 
-                   (int(width*0.4), int(height*0.45)), 0, 0, 360, 1, -1)
+                   (int(width*0.45), int(height*0.5)), 0, 0, 360, 1, -1)
         
-        # Apply full enhancement pipeline even to fallback
-        refined_mask = self.advanced_edge_analysis_fast(image, fallback_mask)
-        trimap = self.create_precise_trimap(refined_mask)
-        alpha = self.spectral_matting_optimized(image, trimap)
-        alpha = self.apply_advanced_bilateral_refinement(image, alpha)
-        decontaminated_image = self.color_decontamination_fast(image, alpha)
+        # Apply advanced enhancement pipeline even to fallback
+        refined_mask = self.advanced_edge_analysis_conservative(image, fallback_mask)
+        trimap = self.create_adaptive_trimap(refined_mask)
+        alpha = self.spectral_matting_multi_colorspace_fixed(image, trimap)
+        alpha = self.apply_enhanced_bilateral_refinement(image, alpha)
+        decontaminated_image = self.color_decontamination_improved(image, alpha)
         
         rgba_result = np.zeros((height, width, 4), dtype=np.uint8)
         rgba_result[:, :, :3] = decontaminated_image
         rgba_result[:, :, 3] = (alpha * 255).astype(np.uint8)
         
         processing_time = time.time() - start_time
-        return rgba_result, "Enhanced Ellipse + U2NET-style", processing_time
+        return rgba_result, "Enhanced Ellipse + Advanced Processing", processing_time
 
     async def remove_background(self, image: np.ndarray) -> Tuple[np.ndarray, str, float]:
-        """Main background removal function with U2NET integration"""
+        """Main background removal function with advanced processing"""
         try:
-            # Try U2NET first - it's specifically designed for this task
+            # Try advanced U2NET first
             if any(name.startswith("u2net") for name in self.model_manager.models.keys()):
                 try:
-                    return await self.remove_background_with_u2net(image)
+                    return await self.remove_background_with_u2net_advanced(image)
                 except Exception as e:
-                    logger.info(f"U2NET failed: {e}, trying enhanced OpenCV")
+                    logger.info(f"Advanced U2NET failed: {e}, trying enhanced OpenCV")
             
             # Fallback to enhanced OpenCV
             return await self.remove_background_opencv_enhanced(image)
             
         except Exception as e:
             logger.error(f"All background removal methods failed: {e}")
-            # Emergency fallback - return original
-            return image, "Failed - No processing", 0.0
+            import traceback
+            traceback.print_exc()
+            # Emergency fallback - return original with alpha channel
+            h, w = image.shape[:2]
+            rgba_result = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba_result[:, :, :3] = image
+            rgba_result[:, :, 3] = 255  # Fully opaque
+            return rgba_result, "Failed - Original Image", 0.0
 
 
 # Initialize components
@@ -729,37 +924,38 @@ bg_remover = None
 async def lifespan(app: FastAPI):
     global bg_remover
     
-    logger.info("Starting Enhanced U2NET Background Removal API...")
+    logger.info("Starting ADVANCED U2NET Background Removal API...")
     
     await model_manager.download_models()
     model_manager.load_models()
-    bg_remover = EnhancedBackgroundRemover(model_manager)
+    bg_remover = AdvancedBackgroundRemover(model_manager)
     
-    logger.info("Enhanced U2NET API ready for processing")
+    logger.info("ADVANCED U2NET API ready for processing")
     
     yield
     
     logger.info("Shutting down...")
 
-app = FastAPI(title="Enhanced U2NET Background Removal API", version="9.0", lifespan=lifespan)
+app = FastAPI(title="Advanced U2NET Background Removal API", version="14.0", lifespan=lifespan)
 
 @app.get("/")
 def read_root():
     return {
-        "message": "Enhanced U2NET Background Removal API",
-        "version": "9.0 - U2NET Integration with Advanced Processing",
+        "message": "Advanced U2NET Background Removal API",
+        "version": "14.0 - Advanced Processing with Fixed Bugs",
         "models_loaded": list(model_manager.models.keys()) if model_manager.models else [],
         "device": str(device),
-        "features": [
-            "U2NET and U2NET-P models",
-            "U2NET Portrait for human subjects",
-            "Advanced ensemble processing",
-            "Enhanced edge analysis",
-            "Spectral matting with multi-color space",
-            "Advanced color decontamination",
-            "Multi-scale bilateral refinement",
-            "Adaptive trimap generation",
-            "High-quality transparency preservation"
+        "advanced_features": [
+            "FIXED aspect ratio preservation in preprocessing",
+            "FIXED cv2 import issue in spectral matting",
+            "Advanced model ensemble with confidence scoring",
+            "Conservative edge analysis with dual color spaces",
+            "Multi-colorspace spectral matting (LAB, HSV, RGB)",
+            "Enhanced bilateral refinement with edge awareness",
+            "Improved color decontamination with background estimation",
+            "Adaptive trimap generation based on image content",
+            "High-quality transparency preservation",
+            "Comprehensive error handling and fallbacks"
         ]
     }
 
@@ -812,7 +1008,23 @@ async def segment_image(challenge: str = Form(...), input: UploadFile = File(...
         original_height, original_width = image.shape[:2]
         logger.info(f"Processing image: {original_width}x{original_height}")
         
+        # Scale down image to max 512x512, preserving aspect ratio
+        max_dim = 512
+        h, w = image.shape[:2]
+        scale = min(max_dim / h, max_dim / w, 1.0)
+        if scale < 1.0:
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            logger.info(f"Image scaled down to {new_w}x{new_h} for processing")
+        else:
+            logger.info("Image size within 512x512, no scaling applied")
+        
         result, method_used, processing_time_seconds = await bg_remover.remove_background(image)
+        
+        # Scale result back up to original size before saving
+        if (result.shape[1], result.shape[0]) != (original_width, original_height):
+            result = cv2.resize(result, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
         
         # Always save as PNG to preserve transparency
         result_path = os.path.join(RESULT_DIR, f"{file_id}.png")
@@ -836,7 +1048,7 @@ async def segment_image(challenge: str = Form(...), input: UploadFile = File(...
                     "processing_time_seconds": processing_time_seconds,
                     "total_time_seconds": total_time,
                     "device": str(device),
-                    "version": "U2NET Enhanced v9.0"
+                    "version": "Advanced U2NET v14.0"
                 }
                 collection.insert_one(document)
             except Exception as e:
@@ -851,11 +1063,13 @@ async def segment_image(challenge: str = Form(...), input: UploadFile = File(...
             "method_used": method_used,
             "processing_time_seconds": processing_time_seconds,
             "total_time_seconds": total_time,
-            "version": "U2NET"
+            "version": "Advanced_U2NET"
         })
         
     except Exception as e:
         logger.error(f"Processing error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"message": f"Processing failed: {str(e)}"}
@@ -883,5 +1097,5 @@ def get_models():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Enhanced U2NET Background Removal API")
+    logger.info("Starting Advanced U2NET Background Removal API")
     uvicorn.run(app, host="0.0.0.0", port=8080)
