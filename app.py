@@ -5,6 +5,8 @@ import time
 import uuid
 import logging
 import asyncio
+import re
+import mimetypes
 from datetime import datetime
 from typing import Optional, Tuple, List
 from contextlib import asynccontextmanager
@@ -25,6 +27,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from pymongo import MongoClient
+from pydantic import BaseModel, validator, Field
 
 from u2net import U2NET, U2NETP
 
@@ -34,6 +37,187 @@ logger = logging.getLogger(__name__)
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 RESULT_DIR = os.getenv("RESULT_DIR", "results")
 MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "models/pretrained")
+
+# BOUNDARY CONSTANTS - Following boundary testing guidelines
+class BoundaryLimits:
+    # String length boundaries
+    CHALLENGE_MIN_LENGTH = 1
+    CHALLENGE_MAX_LENGTH = 20
+    PROCESSING_MODE_MIN_LENGTH = 1  
+    PROCESSING_MODE_MAX_LENGTH = 20
+    
+    # File size boundaries (in bytes)
+    MIN_FILE_SIZE = 1024  # 1KB minimum to ensure it's a real image
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB maximum to prevent server crash like in the story
+    
+    # Numeric boundaries for configuration
+    MIN_PROCESSING_SIZE = 128
+    MAX_PROCESSING_SIZE = 2048
+    MIN_REFINEMENT_THRESHOLD = 0.1
+    MAX_REFINEMENT_THRESHOLD = 100.0
+    
+    # Valid values
+    VALID_CHALLENGES = {"cv3"}  # Only cv3 is supported
+    VALID_PROCESSING_MODES = {"fast", "balanced", "quality"}
+    VALID_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+    VALID_IMAGE_MIME_TYPES = {
+        "image/jpeg", "image/jpg", "image/png", "image/bmp", 
+        "image/tiff", "image/webp", "image/x-ms-bmp"
+    }
+
+class InputValidator:
+    """Comprehensive input validation following boundary testing guidelines"""
+    
+    @staticmethod
+    def sanitize_string(value: str) -> str:
+        """Sanitize string input - trim whitespace and remove dangerous characters"""
+        if not isinstance(value, str):
+            raise ValueError("Input must be a string")
+        
+        # Trim leading and trailing whitespace
+        sanitized = value.strip()
+        
+        # Remove null bytes and other dangerous characters
+        sanitized = sanitized.replace('\x00', '').replace('\n', '').replace('\r', '')
+        sanitized = sanitized.replace('\t', '').replace('\b', '').replace('\f', '')
+        
+        return sanitized
+    
+    @staticmethod
+    def validate_string_boundaries(value: str, field_name: str, min_length: int, max_length: int, 
+                                 allowed_chars_pattern: str = None) -> str:
+        """Validate string boundaries and character content"""
+        # Sanitize first
+        sanitized_value = InputValidator.sanitize_string(value)
+        
+        # Check empty string (lower boundary)
+        if len(sanitized_value) < min_length:
+            raise ValueError(f"{field_name} must be at least {min_length} characters long")
+        
+        # Check maximum length (upper boundary)  
+        if len(sanitized_value) > max_length:
+            raise ValueError(f"{field_name} must not exceed {max_length} characters")
+        
+        # Check character pattern if specified
+        if allowed_chars_pattern and not re.match(allowed_chars_pattern, sanitized_value):
+            raise ValueError(f"{field_name} contains invalid characters")
+        
+        return sanitized_value
+    
+    @staticmethod
+    def validate_challenge(challenge: str) -> str:
+        """Validate challenge parameter with boundary and value checks"""
+        sanitized = InputValidator.validate_string_boundaries(
+            challenge, "challenge", 
+            BoundaryLimits.CHALLENGE_MIN_LENGTH, 
+            BoundaryLimits.CHALLENGE_MAX_LENGTH,
+            r'^[a-zA-Z0-9]+$'  # Only alphanumeric characters
+        )
+        
+        if sanitized not in BoundaryLimits.VALID_CHALLENGES:
+            raise ValueError(f"Invalid challenge value. Allowed: {BoundaryLimits.VALID_CHALLENGES}")
+        
+        return sanitized
+    
+    @staticmethod
+    def validate_processing_mode(mode: str) -> str:
+        """Validate processing mode parameter"""
+        sanitized = InputValidator.validate_string_boundaries(
+            mode, "processing_mode",
+            BoundaryLimits.PROCESSING_MODE_MIN_LENGTH,
+            BoundaryLimits.PROCESSING_MODE_MAX_LENGTH,
+            r'^[a-zA-Z0-9_-]+$'  # Alphanumeric, underscore, hyphen
+        )
+        
+        if sanitized not in BoundaryLimits.VALID_PROCESSING_MODES:
+            raise ValueError(f"Invalid processing mode. Allowed: {BoundaryLimits.VALID_PROCESSING_MODES}")
+        
+        return sanitized
+    
+    @staticmethod
+    async def validate_uploaded_file(file: UploadFile) -> None:
+        """Comprehensive file validation following boundary testing guidelines"""
+        # Check if file exists
+        if not file or not file.filename:
+            raise ValueError("No file provided")
+        
+        # Sanitize filename
+        sanitized_filename = InputValidator.sanitize_string(file.filename)
+        if not sanitized_filename:
+            raise ValueError("Invalid filename")
+        
+        # Read file content for size validation
+        file_content = await file.read()
+        file_size = len(file_content)
+        
+        # Reset file pointer for later reading
+        await file.seek(0)
+        
+        # File size boundaries
+        if file_size < BoundaryLimits.MIN_FILE_SIZE:
+            raise ValueError(f"File too small. Minimum size: {BoundaryLimits.MIN_FILE_SIZE} bytes")
+        
+        if file_size > BoundaryLimits.MAX_FILE_SIZE:
+            raise ValueError(f"File too large. Maximum size: {BoundaryLimits.MAX_FILE_SIZE} bytes "
+                           f"({BoundaryLimits.MAX_FILE_SIZE // (1024*1024)}MB)")
+        
+        # Content-Type validation (first check)
+        if not file.content_type or file.content_type not in BoundaryLimits.VALID_IMAGE_MIME_TYPES:
+            raise ValueError(f"Invalid file type. Allowed types: {BoundaryLimits.VALID_IMAGE_MIME_TYPES}")
+        
+        # File extension validation
+        file_ext = os.path.splitext(sanitized_filename)[1].lower()
+        if file_ext not in BoundaryLimits.VALID_IMAGE_EXTENSIONS:
+            raise ValueError(f"Invalid file extension. Allowed: {BoundaryLimits.VALID_IMAGE_EXTENSIONS}")
+        
+        # Advanced file content validation - check if it's actually an image
+        try:
+            # Try to open with PIL to verify it's a real image
+            image_pil = Image.open(io.BytesIO(file_content))
+            image_pil.verify()  # Verify the image integrity
+            
+            # Additional check - try to load as numpy array
+            image_pil = Image.open(io.BytesIO(file_content))  # Reopen after verify
+            np.array(image_pil)
+            
+        except Exception as e:
+            raise ValueError(f"File is not a valid image or is corrupted: {str(e)}")
+        
+        # Reset file pointer again
+        await file.seek(0)
+        
+        logger.info(f"File validation passed: {sanitized_filename}, size: {file_size} bytes")
+    
+    @staticmethod
+    def validate_numeric_boundaries(value: any, field_name: str, min_val: float, max_val: float) -> float:
+        """Validate numeric boundaries"""
+        try:
+            numeric_val = float(value)
+        except (ValueError, TypeError):
+            raise ValueError(f"{field_name} must be a valid number")
+        
+        if numeric_val < min_val:
+            raise ValueError(f"{field_name} must be at least {min_val}")
+        
+        if numeric_val > max_val:
+            raise ValueError(f"{field_name} must not exceed {max_val}")
+        
+        return numeric_val
+    
+    @staticmethod
+    def validate_boolean(value: any, field_name: str) -> bool:
+        """Validate boolean values"""
+        if isinstance(value, bool):
+            return value
+        
+        if isinstance(value, str):
+            sanitized = InputValidator.sanitize_string(value).lower()
+            if sanitized in {'true', '1', 'yes', 'on'}:
+                return True
+            elif sanitized in {'false', '0', 'no', 'off'}:
+                return False
+        
+        raise ValueError(f"{field_name} must be a valid boolean value")
 
 for dir_path in [UPLOAD_DIR, RESULT_DIR, MODEL_CACHE_DIR]:
     os.makedirs(dir_path, exist_ok=True)
@@ -550,13 +734,13 @@ async def lifespan(app: FastAPI):
     
     logger.info("Shutting down...")
 
-app = FastAPI(title="Hybrid U2NET Background Removal API", version="16.0", lifespan=lifespan)
+app = FastAPI(title="Hybrid U2NET Background Removal API", version="16.1", lifespan=lifespan)
 
 @app.get("/")
 def read_root():
     return {
         "message": "Hybrid U2NET Background Removal API",
-        "version": "16.0 - Hybrid Processing with Global Context",
+        "version": "16.1 - Enhanced with Comprehensive Boundary Testing",
         "models_loaded": list(model_manager.models.keys()) if model_manager.models else [],
         "device": str(device),
         "features": [
@@ -566,10 +750,20 @@ def read_root():
             "No artifacts from tile boundaries",
             "Adaptive processing based on image size",
             "Edge-preserving smoothing and guided filtering",
-            "Multiple processing quality levels"
+            "Multiple processing quality levels",
+            "Comprehensive boundary testing and input validation",
+            "File size limits and content validation",
+            "String sanitization and character validation"
         ],
         "processing_modes": {
             mode: config["description"] for mode, config in PROCESSING_CONFIGS.items()
+        },
+        "boundary_limits": {
+            "max_file_size_mb": BoundaryLimits.MAX_FILE_SIZE // (1024*1024),
+            "min_file_size_kb": BoundaryLimits.MIN_FILE_SIZE // 1024,
+            "supported_formats": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS),
+            "valid_challenges": list(BoundaryLimits.VALID_CHALLENGES),
+            "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES)
         }
     }
 
@@ -590,6 +784,11 @@ def health_check():
             "max_size": bg_remover.max_processing_size if bg_remover else None,
             "refinement_enabled": bg_remover.enable_refinement if bg_remover else None,
             "refinement_threshold_mp": (bg_remover.refinement_threshold / (1024*1024)) if bg_remover else None
+        },
+        "boundary_validation": {
+            "file_size_limits": f"{BoundaryLimits.MIN_FILE_SIZE // 1024}KB - {BoundaryLimits.MAX_FILE_SIZE // (1024*1024)}MB",
+            "string_length_limits": f"Challenge: {BoundaryLimits.CHALLENGE_MIN_LENGTH}-{BoundaryLimits.CHALLENGE_MAX_LENGTH}, Mode: {BoundaryLimits.PROCESSING_MODE_MIN_LENGTH}-{BoundaryLimits.PROCESSING_MODE_MAX_LENGTH}",
+            "supported_extensions": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS)
         }
     }
 
@@ -604,37 +803,83 @@ async def segment_image(
     try:
         logger.info(f"Processing request - Challenge: {challenge}, File: {input.filename}, Mode: {processing_mode}")
         
-        if challenge != "cv3":
+        # COMPREHENSIVE BOUNDARY TESTING - Following the guidelines
+        try:
+            # Validate challenge parameter (string boundaries and content)
+            validated_challenge = InputValidator.validate_challenge(challenge)
+            
+            # Validate processing mode parameter
+            validated_processing_mode = InputValidator.validate_processing_mode(processing_mode)
+            
+            # Comprehensive file validation (size, type, content)
+            await InputValidator.validate_uploaded_file(input)
+            
+        except ValueError as e:
+            logger.warning(f"Boundary validation failed: {str(e)}")
             return JSONResponse(
                 status_code=400,
-                content={"message": f"Only cv3 supported, received: {challenge}"}
+                content={
+                    "message": f"Input validation failed: {str(e)}",
+                    "error_type": "boundary_validation_error",
+                    "boundary_limits": {
+                        "max_file_size_mb": BoundaryLimits.MAX_FILE_SIZE // (1024*1024),
+                        "min_file_size_kb": BoundaryLimits.MIN_FILE_SIZE // 1024,
+                        "valid_challenges": list(BoundaryLimits.VALID_CHALLENGES),
+                        "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES),
+                        "supported_formats": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS)
+                    }
+                }
             )
         
-        if not input.content_type.startswith("image/"):
-            return JSONResponse(
-                status_code=400,
-                content={"message": "File must be an image"}
-            )
-        
-        if processing_mode in PROCESSING_CONFIGS:
+        # Configure processing mode if it's valid
+        if validated_processing_mode in PROCESSING_CONFIGS:
             global bg_remover
-            bg_remover = create_optimized_bg_remover(model_manager, processing_mode)
+            bg_remover = create_optimized_bg_remover(model_manager, validated_processing_mode)
         
+        # Generate secure file ID
         file_id = str(uuid.uuid4())
-        file_extension = os.path.splitext(input.filename)[1] or ".jpg"
+        file_extension = os.path.splitext(input.filename)[1].lower() or ".jpg"
+        
+        # Validate file extension again (double-check)
+        if file_extension not in BoundaryLimits.VALID_IMAGE_EXTENSIONS:
+            raise ValueError(f"Invalid file extension: {file_extension}")
+        
         file_path = os.path.join(UPLOAD_DIR, f"{file_id}{file_extension}")
         
+        # Save file securely
         contents = await input.read()
         with open(file_path, "wb") as f:
             f.write(contents)
         
+        # Additional image validation after saving
         image = cv2.imread(file_path)
         if image is None:
-            raise HTTPException(status_code=400, detail="Could not read image")
+            # Clean up the invalid file
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            raise HTTPException(status_code=400, detail="Could not read image file - file may be corrupted")
         
         original_height, original_width = image.shape[:2]
         total_pixels = original_height * original_width
-        logger.info(f"Processing image: {original_width}x{original_height} ({total_pixels / (1024*1024):.1f}MP)")
+        
+        # Additional boundary check - image dimensions
+        if original_width < 32 or original_height < 32:
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            raise HTTPException(status_code=400, detail="Image too small - minimum dimensions: 32x32 pixels")
+        
+        if original_width > 10000 or original_height > 10000:
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            raise HTTPException(status_code=400, detail="Image too large - maximum dimensions: 10000x10000 pixels")
+        
+        logger.info(f"Processing validated image: {original_width}x{original_height} ({total_pixels / (1024*1024):.1f}MP)")
         
         result, method_used, processing_time_seconds = await bg_remover.remove_background(image)
         
@@ -651,18 +896,20 @@ async def segment_image(
                 document = {
                     "original_file": file_path,
                     "processed_file": result_path,
-                    "challenge": challenge,
+                    "challenge": validated_challenge,
                     "timestamp": start_time,
                     "file_id": file_id,
                     "original_size": f"{original_width}x{original_height}",
                     "megapixels": total_pixels / (1024 * 1024),
                     "method_used": method_used,
-                    "processing_mode": processing_mode,
+                    "processing_mode": validated_processing_mode,
                     "processing_time_seconds": processing_time_seconds,
                     "total_time_seconds": total_time,
                     "device": str(device),
-                    "version": "Hybrid U2NET v16.0",
-                    "used_refinement": "Refinement" in method_used
+                    "version": "Hybrid U2NET v16.1 - Enhanced Boundary Testing",
+                    "used_refinement": "Refinement" in method_used,
+                    "file_size_bytes": len(contents),
+                    "boundary_validation_passed": True
                 }
                 collection.insert_one(document)
             except Exception as e:
@@ -675,14 +922,20 @@ async def segment_image(
             "message": "succeed", 
             "file_id": file_id,
             "method_used": method_used,
-            "processing_mode": processing_mode,
+            "processing_mode": validated_processing_mode,
             "processing_time_seconds": processing_time_seconds,
             "total_time_seconds": total_time,
-            "version": "Hybrid_U2NET",
+            "version": "Hybrid_U2NET_Enhanced",
             "image_info": {
                 "size": f"{original_width}x{original_height}",
                 "megapixels": f"{total_pixels / (1024 * 1024):.1f}MP",
-                "used_refinement": "Refinement" in method_used
+                "used_refinement": "Refinement" in method_used,
+                "file_size_kb": f"{len(contents) / 1024:.1f}KB"
+            },
+            "validation_info": {
+                "boundary_checks_passed": True,
+                "challenge_validated": validated_challenge,
+                "processing_mode_validated": validated_processing_mode
             }
         })
         
@@ -697,14 +950,25 @@ async def segment_image(
 
 @app.get("/result/{file_id}")
 async def get_result(file_id: str):
-    result_path = os.path.join(RESULT_DIR, f"{file_id}.png")
-    if os.path.exists(result_path):
-        return FileResponse(result_path)
-    
-    return JSONResponse(
-        status_code=404,
-        content={"message": "Result not found"}
-    )
+    try:
+        # Validate file_id format (boundary testing for path parameters)
+        validated_file_id = InputValidator.validate_string_boundaries(
+            file_id, "file_id", 1, 100, r'^[a-zA-Z0-9-]+$'
+        )
+        
+        result_path = os.path.join(RESULT_DIR, f"{validated_file_id}.png")
+        if os.path.exists(result_path):
+            return FileResponse(result_path)
+        
+        return JSONResponse(
+            status_code=404,
+            content={"message": "Result not found"}
+        )
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"message": f"Invalid file ID: {str(e)}"}
+        )
 
 @app.get("/models")
 def get_models():
@@ -713,7 +977,18 @@ def get_models():
         "model_configs": {k: {**v, "model_class": str(v.get("model_class", "None"))} 
                          for k, v in model_manager.model_configs.items()},
         "device": str(device),
-        "processing_configs": PROCESSING_CONFIGS
+        "processing_configs": PROCESSING_CONFIGS,
+        "boundary_validation": {
+            "file_size_limits": {
+                "min_bytes": BoundaryLimits.MIN_FILE_SIZE,
+                "max_bytes": BoundaryLimits.MAX_FILE_SIZE,
+                "min_display": f"{BoundaryLimits.MIN_FILE_SIZE // 1024}KB",
+                "max_display": f"{BoundaryLimits.MAX_FILE_SIZE // (1024*1024)}MB"
+            },
+            "supported_formats": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS),
+            "valid_challenges": list(BoundaryLimits.VALID_CHALLENGES),
+            "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES)
+        }
     }
 
 @app.post("/configure")
@@ -731,22 +1006,54 @@ async def configure_processing(
         )
     
     try:
-        bg_remover.max_processing_size = max_processing_size
-        bg_remover.enable_refinement = enable_refinement
-        bg_remover.refinement_threshold = int(refinement_threshold_mp * 1024 * 1024)
+        # BOUNDARY TESTING for configuration parameters
+        validated_max_size = int(InputValidator.validate_numeric_boundaries(
+            max_processing_size, "max_processing_size", 
+            BoundaryLimits.MIN_PROCESSING_SIZE, BoundaryLimits.MAX_PROCESSING_SIZE
+        ))
         
-        logger.info(f"Processing reconfigured: max_size={max_processing_size}, "
-                   f"refinement={enable_refinement}, threshold={refinement_threshold_mp}MP")
+        validated_refinement = InputValidator.validate_boolean(enable_refinement, "enable_refinement")
+        
+        validated_threshold = InputValidator.validate_numeric_boundaries(
+            refinement_threshold_mp, "refinement_threshold_mp",
+            BoundaryLimits.MIN_REFINEMENT_THRESHOLD, BoundaryLimits.MAX_REFINEMENT_THRESHOLD
+        )
+        
+        bg_remover.max_processing_size = validated_max_size
+        bg_remover.enable_refinement = validated_refinement
+        bg_remover.refinement_threshold = int(validated_threshold * 1024 * 1024)
+        
+        logger.info(f"Processing reconfigured: max_size={validated_max_size}, "
+                   f"refinement={validated_refinement}, threshold={validated_threshold}MP")
         
         return JSONResponse(content={
             "message": "Processing configuration updated successfully",
             "config": {
-                "max_processing_size": max_processing_size,
-                "enable_refinement": enable_refinement,
-                "refinement_threshold_mp": refinement_threshold_mp
+                "max_processing_size": validated_max_size,
+                "enable_refinement": validated_refinement,
+                "refinement_threshold_mp": validated_threshold
+            },
+            "boundary_validation": {
+                "all_parameters_validated": True,
+                "applied_limits": {
+                    "max_processing_size_range": f"{BoundaryLimits.MIN_PROCESSING_SIZE}-{BoundaryLimits.MAX_PROCESSING_SIZE}",
+                    "refinement_threshold_range": f"{BoundaryLimits.MIN_REFINEMENT_THRESHOLD}-{BoundaryLimits.MAX_REFINEMENT_THRESHOLD}MP"
+                }
             }
         })
         
+    except ValueError as e:
+        logger.error(f"Configuration validation failed: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": f"Configuration validation failed: {str(e)}",
+                "boundary_limits": {
+                    "max_processing_size_range": f"{BoundaryLimits.MIN_PROCESSING_SIZE}-{BoundaryLimits.MAX_PROCESSING_SIZE}",
+                    "refinement_threshold_range": f"{BoundaryLimits.MIN_REFINEMENT_THRESHOLD}-{BoundaryLimits.MAX_REFINEMENT_THRESHOLD}MP"
+                }
+            }
+        )
     except Exception as e:
         logger.error(f"Failed to reconfigure: {e}")
         return JSONResponse(
@@ -756,5 +1063,5 @@ async def configure_processing(
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Hybrid U2NET Background Removal API")
+    logger.info("Starting Background Removal API...")
     uvicorn.run(app, host="0.0.0.0", port=8080)
