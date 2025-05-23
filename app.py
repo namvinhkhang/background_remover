@@ -1146,19 +1146,19 @@ async def lifespan(app: FastAPI):
     
     bg_remover = create_optimized_bg_remover(model_manager, "balanced")
     
-    logger.info("HYBRID U2NET API ready for processing")
+    logger.info("API ready for processing")
     
     yield
     
     logger.info("Shutting down...")
 
-app = FastAPI(title="Hybrid U2NET Background Removal API", version="16.2", lifespan=lifespan)
+app = FastAPI(title="Background Removal API", version="2.0", lifespan=lifespan)
 
 @app.get("/")
 def read_root():
     return {
-        "message": "Hybrid U2NET Background Removal API",
-        "version": "16.2 - Enhanced with Comprehensive Boundary Testing & Type Safety",
+        "message": "Background Removal API",
+        "version": "2.0 - Enhanced with Comprehensive Boundary Testing & Type Safety",
         "models_loaded": list(model_manager.models.keys()) if model_manager.models else [],
         "device": str(device),
         "features": [
@@ -1498,5 +1498,5 @@ async def configure_processing(
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Enhanced Hybrid U2NET Background Removal API with Comprehensive Boundary Testing & Type Safety")
+    logger.info("Starting Background Removal API...")
     uvicorn.run(app, host="0.0.0.0", port=8080)
