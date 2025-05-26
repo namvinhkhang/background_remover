@@ -1154,27 +1154,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Background Removal API", version="2.0", lifespan=lifespan)
 
-@app.get("/")
-def read_root():
-    return {
-        "message": "Background Removal API",
-        "version": "2.0",
-        "models_loaded": list(model_manager.models.keys()) if model_manager.models else [],
-        "device": str(device),
-        "processing_modes": {
-            mode: config["description"] for mode, config in PROCESSING_CONFIGS.items()
-        },
-        "boundary_limits": {
-            "max_file_size_mb": BoundaryLimits.MAX_FILE_SIZE // (1024*1024),
-            "min_file_size_kb": BoundaryLimits.MIN_FILE_SIZE // 1024,
-            "supported_formats": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS),
-            "valid_challenges": list(BoundaryLimits.VALID_CHALLENGES),
-            "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES),
-            "max_processing_time_seconds": BoundaryLimits.MAX_PROCESSING_TIME_SECONDS,
-            "max_image_dimensions": f"{BoundaryLimits.MAX_IMAGE_WIDTH}x{BoundaryLimits.MAX_IMAGE_HEIGHT}"
-        }
-    }
-
 @app.post("/segmentation")
 async def segment_image(
     challenge: str = Form(...), 
