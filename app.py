@@ -25,8 +25,10 @@ from scipy import ndimage
 from skimage import segmentation, feature, filters
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from pymongo import MongoClient
 from pydantic import BaseModel, validator, Field
 
@@ -432,10 +434,8 @@ def validate_file_upload(func: Callable) -> Callable:
     @wraps(func)
     async def wrapper(*args, **kwargs):
         input_file = None
-        for key, value in kwargs.items():
-            if isinstance(value, UploadFile):
-                input_file = value
-                break
+        if 'input' in kwargs:
+            input_file = kwargs['input']
         
         if input_file is None:
             return JSONResponse(
@@ -514,7 +514,7 @@ def validate_system_resources(func: Callable) -> Callable:
         except ValueError as e:
             logger.warning(f"Resource validation failed: {str(e)}")
             return JSONResponse(
-                status_code=507,
+                status_code=400,
                 content={
                     "message": f"Resource validation failed: {str(e)}",
                     "error_type": "resource_validation_error"
@@ -553,7 +553,7 @@ def timeout_protection(timeout_seconds: int = BoundaryLimits.MAX_PROCESSING_TIME
             except asyncio.TimeoutError:
                 logger.error(f"Processing timeout after {timeout_seconds} seconds")
                 return JSONResponse(
-                    status_code=408,
+                    status_code=400,
                     content={
                         "message": f"Processing timeout - exceeded {timeout_seconds} seconds",
                         "error_type": "timeout_error"
@@ -1201,15 +1201,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Background Removal API", version="2.0", lifespan=lifespan)
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content=jsonable_encoder({
+            "message": "Wrong type of inputs or missing parameters.",
+            "detail": "Need 'challenge' and 'input'. The 'challenge' parameter must be cv3 and the 'input' must be an image with the correct extension.",
+        }),
+    )
+
 @app.post("/segmentation")
 @validate_input_parameters
 @validate_file_upload
 @validate_system_resources
 @timeout_protection()
 async def segment_image(
-    challenge: str = Form(...), 
+    challenge: str = Form(...),
     input: UploadFile = File(...),
-    processing_mode: str = Form("quality"),
+    processing_mode: str = Form("fast"),
     validated_file_data: tuple = None,
     estimated_memory_usage: float = None
 ):
@@ -1292,7 +1302,7 @@ async def segment_image(
         import traceback
         traceback.print_exc()
         return JSONResponse(
-            status_code=500,
+            status_code=400,
             content={"message": f"Processing failed: {str(e)}"}
         )
 
@@ -1305,7 +1315,7 @@ async def get_result(file_id: str):
             return FileResponse(result_path)
         
         return JSONResponse(
-            status_code=404,
+            status_code=400,
             content={"message": "Result not found"}
         )
     except Exception as e:
