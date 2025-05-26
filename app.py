@@ -41,10 +41,10 @@ MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "models/pretrained")
 # BOUNDARY CONSTANTS - Following boundary testing guidelines
 class BoundaryLimits:
     # String length boundaries
-    CHALLENGE_MIN_LENGTH = 1
-    CHALLENGE_MAX_LENGTH = 20
-    PROCESSING_MODE_MIN_LENGTH = 1  
-    PROCESSING_MODE_MAX_LENGTH = 20
+    CHALLENGE_MIN_LENGTH = 3
+    CHALLENGE_MAX_LENGTH = 3
+    PROCESSING_MODE_MIN_LENGTH = 4 
+    PROCESSING_MODE_MAX_LENGTH = 9
     
     # File size boundaries (in bytes)
     MIN_FILE_SIZE = 1024  # 1KB minimum to ensure it's a real image
