@@ -1158,25 +1158,9 @@ app = FastAPI(title="Background Removal API", version="2.0", lifespan=lifespan)
 def read_root():
     return {
         "message": "Background Removal API",
-        "version": "2.0 - Enhanced with Comprehensive Boundary Testing & Type Safety",
+        "version": "2.0",
         "models_loaded": list(model_manager.models.keys()) if model_manager.models else [],
         "device": str(device),
-        "features": [
-            "Scale-down processing for global context",
-            "Preserves full image context for better object detection",
-            "Optional guided refinement for high-resolution details",
-            "No artifacts from tile boundaries",
-            "Adaptive processing based on image size",
-            "Edge-preserving smoothing and guided filtering",
-            "Multiple processing quality levels",
-            "Comprehensive boundary testing and input validation",
-            "File size limits and content validation",
-            "String sanitization and character validation",
-            "Magic number file type validation",
-            "Dangerous content detection",
-            "Memory and resource validation",
-            "Processing timeout protection"
-        ],
         "processing_modes": {
             mode: config["description"] for mode, config in PROCESSING_CONFIGS.items()
         },
@@ -1188,32 +1172,6 @@ def read_root():
             "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES),
             "max_processing_time_seconds": BoundaryLimits.MAX_PROCESSING_TIME_SECONDS,
             "max_image_dimensions": f"{BoundaryLimits.MAX_IMAGE_WIDTH}x{BoundaryLimits.MAX_IMAGE_HEIGHT}"
-        }
-    }
-
-@app.get("/health")
-def health_check():
-    memory_info = psutil.virtual_memory()
-    
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "models_available": list(model_manager.models.keys()),
-        "device": str(device),
-        "system": {
-            "memory_usage": f"{memory_info.percent}%",
-            "memory_available": f"{memory_info.available / (1024**3):.1f}GB"
-        },
-        "processing_config": {
-            "max_size": bg_remover.max_processing_size if bg_remover else None,
-            "refinement_enabled": bg_remover.enable_refinement if bg_remover else None,
-            "refinement_threshold_mp": (bg_remover.refinement_threshold / (1024*1024)) if bg_remover else None
-        },
-        "boundary_validation": {
-            "file_size_limits": f"{BoundaryLimits.MIN_FILE_SIZE // 1024}KB - {BoundaryLimits.MAX_FILE_SIZE // (1024*1024)}MB",
-            "string_length_limits": f"Challenge: {BoundaryLimits.CHALLENGE_MIN_LENGTH}-{BoundaryLimits.CHALLENGE_MAX_LENGTH}, Mode: {BoundaryLimits.PROCESSING_MODE_MIN_LENGTH}-{BoundaryLimits.PROCESSING_MODE_MAX_LENGTH}",
-            "supported_extensions": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS),
-            "memory_limits": f"Min: {BoundaryLimits.MIN_AVAILABLE_MEMORY_MB}MB, Max processing: {BoundaryLimits.MAX_PROCESSING_MEMORY_MB}MB"
         }
     }
 
@@ -1395,105 +1353,6 @@ async def get_result(file_id: str):
         return JSONResponse(
             status_code=400,
             content={"message": f"Invalid file ID: {str(e)}"}
-        )
-
-@app.get("/models")
-def get_models():
-    return {
-        "loaded_models": list(model_manager.models.keys()),
-        "model_configs": {k: {**v, "model_class": str(v.get("model_class", "None"))} 
-                         for k, v in model_manager.model_configs.items()},
-        "device": str(device),
-        "processing_configs": PROCESSING_CONFIGS,
-        "boundary_validation": {
-            "file_size_limits": {
-                "min_bytes": BoundaryLimits.MIN_FILE_SIZE,
-                "max_bytes": BoundaryLimits.MAX_FILE_SIZE,
-                "min_display": f"{BoundaryLimits.MIN_FILE_SIZE // 1024}KB",
-                "max_display": f"{BoundaryLimits.MAX_FILE_SIZE // (1024*1024)}MB"
-            },
-            "supported_formats": list(BoundaryLimits.VALID_IMAGE_EXTENSIONS),
-            "valid_challenges": list(BoundaryLimits.VALID_CHALLENGES),
-            "valid_processing_modes": list(BoundaryLimits.VALID_PROCESSING_MODES),
-            "memory_limits": {
-                "min_available_mb": BoundaryLimits.MIN_AVAILABLE_MEMORY_MB,
-                "max_processing_mb": BoundaryLimits.MAX_PROCESSING_MEMORY_MB
-            },
-            "processing_limits": {
-                "max_time_seconds": BoundaryLimits.MAX_PROCESSING_TIME_SECONDS,
-                "max_image_dimensions": f"{BoundaryLimits.MAX_IMAGE_WIDTH}x{BoundaryLimits.MAX_IMAGE_HEIGHT}"
-            }
-        }
-    }
-
-@app.post("/configure")
-async def configure_processing(
-    max_processing_size: int = Form(512),
-    enable_refinement: bool = Form(True),
-    refinement_threshold_mp: float = Form(4.0)
-):
-    global bg_remover
-    
-    if bg_remover is None:
-        return JSONResponse(
-            status_code=400,
-            content={"message": "Background remover not initialized"}
-        )
-    
-    try:
-        # INTERNAL BOUNDARY TESTING for configuration parameters
-        validated_max_size = int(InputValidator.validate_numeric_boundaries(
-            max_processing_size, "max_processing_size", 
-            BoundaryLimits.MIN_PROCESSING_SIZE, BoundaryLimits.MAX_PROCESSING_SIZE
-        ))
-        
-        validated_refinement = InputValidator.validate_boolean(enable_refinement, "enable_refinement")
-        
-        validated_threshold = InputValidator.validate_numeric_boundaries(
-            refinement_threshold_mp, "refinement_threshold_mp",
-            BoundaryLimits.MIN_REFINEMENT_THRESHOLD, BoundaryLimits.MAX_REFINEMENT_THRESHOLD
-        )
-        
-        bg_remover.max_processing_size = validated_max_size
-        bg_remover.enable_refinement = validated_refinement
-        bg_remover.refinement_threshold = int(validated_threshold * 1024 * 1024)
-        
-        logger.info(f"Processing reconfigured: max_size={validated_max_size}, "
-                   f"refinement={validated_refinement}, threshold={validated_threshold}MP")
-        
-        return JSONResponse(content={
-            "message": "Processing configuration updated successfully",
-            "config": {
-                "max_processing_size": validated_max_size,
-                "enable_refinement": validated_refinement,
-                "refinement_threshold_mp": validated_threshold
-            },
-            "boundary_validation": {
-                "all_parameters_validated": True,
-                "applied_limits": {
-                    "max_processing_size_range": f"{BoundaryLimits.MIN_PROCESSING_SIZE}-{BoundaryLimits.MAX_PROCESSING_SIZE}",
-                    "refinement_threshold_range": f"{BoundaryLimits.MIN_REFINEMENT_THRESHOLD}-{BoundaryLimits.MAX_REFINEMENT_THRESHOLD}MP"
-                }
-            }
-        })
-        
-    except ValueError as e:
-        logger.error(f"Configuration validation failed: {e}")
-        return JSONResponse(
-            status_code=400,
-            content={
-                "message": f"Configuration validation failed: {str(e)}",
-                "boundary_limits": {
-                    "max_processing_size_range": f"{BoundaryLimits.MIN_PROCESSING_SIZE}-{BoundaryLimits.MAX_PROCESSING_SIZE}",
-                    "refinement_threshold_range": f"{BoundaryLimits.MIN_REFINEMENT_THRESHOLD}-{BoundaryLimits.MAX_REFINEMENT_THRESHOLD}MP"
-                }
-            }
-        )
-    except Exception as e:
-        logger.error(f"Failed to reconfigure: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"message": f"Failed to update configuration: {str(e)}"}
         )
 
 if __name__ == "__main__":
