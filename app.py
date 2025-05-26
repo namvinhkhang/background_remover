@@ -1285,7 +1285,6 @@ async def segment_image(
                     "processing_time_seconds": processing_time_seconds,
                     "total_time_seconds": total_time,
                     "device": str(device),
-                    "version": "Hybrid U2NET v16.2 - Enhanced Type Safety",
                     "used_refinement": "Refinement" in method_used,
                     "file_size_bytes": len(file_content),
                     "boundary_validation_passed": True,
@@ -1302,26 +1301,8 @@ async def segment_image(
             "message": "succeed", 
             "file_id": file_id,
             "method_used": method_used,
-            "processing_mode": validated_processing_mode,
             "processing_time_seconds": processing_time_seconds,
             "total_time_seconds": total_time,
-            "version": "Hybrid_U2NET_Enhanced_TypeSafe",
-            "image_info": {
-                "size": f"{width}x{height}",
-                "megapixels": f"{(width * height) / (1024 * 1024):.1f}MP",
-                "detected_type": detected_type,
-                "used_refinement": "Refinement" in method_used,
-                "file_size_kb": f"{len(file_content) / 1024:.1f}KB",
-                "memory_used_mb": f"{required_memory:.1f}MB"
-            },
-            "validation_info": {
-                "boundary_checks_passed": True,
-                "type_safety_passed": True,
-                "challenge_validated": validated_challenge,
-                "processing_mode_validated": validated_processing_mode,
-                "memory_validation_passed": True,
-                "disk_space_validation_passed": True
-            }
         })
         
     except Exception as e:
